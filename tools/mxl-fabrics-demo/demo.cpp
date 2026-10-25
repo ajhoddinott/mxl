@@ -512,7 +512,8 @@ public:
 
         while (!g_exit_requested)
         {
-            auto status = mxlFlowReaderGetSamplesNonBlocking(_reader, headIndex, batchSize, &payload);
+            // Short timeout: writers built with libmxl before 1.0.2 do not wake waiting readers.
+            auto status = mxlFlowReaderGetSamples(_reader, headIndex, batchSize, 1000000, &payload);
             if (status == MXL_ERR_OUT_OF_RANGE_TOO_LATE)
             {
                 // We are too late.. time travel to the last headIndex commited!
