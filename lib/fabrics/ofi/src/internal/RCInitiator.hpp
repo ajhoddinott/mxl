@@ -86,6 +86,10 @@ namespace mxl::lib::fabrics::ofi
          */
         void transferSamples(std::uint64_t headIndex, std::size_t count);
 
+        /** \brief Post queued transfers, if this endpoint is connected.
+         */
+        void postQueued();
+
     private:
         /** \brief The idle state.
          *

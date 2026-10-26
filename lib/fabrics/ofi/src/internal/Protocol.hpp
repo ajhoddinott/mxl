@@ -97,8 +97,25 @@ namespace mxl::lib::fabrics::ofi
         virtual void transferSamples(Endpoint const& ep, std::uint64_t headIndex, std::size_t count, ::fi_addr_t destAddr = FI_ADDR_UNSPEC) = 0;
 
         /** \brief Process a completion event. Any post-processing after a transfer should be done here.
+         * \param ep The endpoint the transfer was posted on.
+         * \param completion The completion event.
+         * \param destAddr The destination address. This is ignored for connection-oriented endpoints.
          */
-        virtual void processCompletion(Completion::Data const& completion) = 0;
+        virtual void processCompletion(Endpoint const& ep, Completion::Data const& completion, ::fi_addr_t destAddr = FI_ADDR_UNSPEC) = 0;
+
+        /** \brief Process a write that completed with an error.
+         * \param ep The endpoint the write was posted on.
+         * \param destAddr The destination address. This is ignored for connection-oriented endpoints.
+         */
+        virtual void processCompletionError([[maybe_unused]] Endpoint const& ep, [[maybe_unused]] ::fi_addr_t destAddr = FI_ADDR_UNSPEC)
+        {}
+
+        /** \brief Post queued transfers that can be posted now. Called on every progress call.
+         * \param ep The endpoint to post on.
+         * \param destAddr The destination address. This is ignored for connection-oriented endpoints.
+         */
+        virtual void postQueued([[maybe_unused]] Endpoint const& ep, [[maybe_unused]] ::fi_addr_t destAddr = FI_ADDR_UNSPEC)
+        {}
 
         /** \brief Check if there is uncompleted requests.
          */

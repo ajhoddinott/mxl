@@ -232,6 +232,13 @@ namespace mxl::lib::fabrics::ofi
 
     void RCInitiatorEndpoint::handleCompletionData(Completion::Data completion)
     {
+        // Not inside the visit below: it moves the endpoint out of _state, which would be lost if posting the next part throws.
+        if (auto const state = std::get_if<Connected>(&_state); state != nullptr)
+        {
+            _proto->processCompletion(state->ep, completion);
+            return;
+        }
+
         _state = std::visit(
             overloaded{[](Idle state) -> State
                 {
@@ -243,11 +250,7 @@ namespace mxl::lib::fabrics::ofi
                     MXL_WARN("Received a completion event while connecting, ignoring.");
                     return state;
                 },
-                [&](Connected state) -> State
-                {
-                    _proto->processCompletion(completion);
-                    return state;
-                },
+                [](Connected state) -> State { return state; },
                 [](Flushing state) -> State
                 {
                     state.pending--; // Decrease the counter of completions that must still be flushed.
@@ -261,9 +264,22 @@ namespace mxl::lib::fabrics::ofi
             std::move(_state));
     }
 
+    void RCInitiatorEndpoint::postQueued()
+    {
+        if (auto const state = std::get_if<Connected>(&_state); state != nullptr)
+        {
+            _proto->postQueued(state->ep);
+        }
+    }
+
     void RCInitiatorEndpoint::handleCompletionError(Completion::Error err)
     {
         MXL_ERROR("Received a completion error: {}", err.toString());
+
+        if (auto const state = std::get_if<Connected>(&_state); state != nullptr)
+        {
+            _proto->processCompletionError(state->ep);
+        }
     }
 
     RCInitiatorEndpoint::Idle RCInitiatorEndpoint::restart(Endpoint const& old)
@@ -384,6 +400,7 @@ namespace mxl::lib::fabrics::ofi
         for (auto& [_, target] : _targets)
         {
             target.activate(_cq, _eq);
+            target.postQueued();
         }
     }
 

@@ -354,7 +354,7 @@ namespace mxl::lib::fabrics::ofi
     }
 
     std::size_t Endpoint::write(Completion::Token token, LocalRegionGroup const& localGroup, RemoteRegion const& remote, ::fi_addr_t destAddr,
-        std::optional<std::uint32_t> immData) const
+        std::optional<std::uint32_t> immData, std::size_t* posted) const
     {
         auto remoteRmaIov = remote.toRmaIov();
         auto remoteOffset = std::size_t{0};
@@ -388,6 +388,10 @@ namespace mxl::lib::fabrics::ofi
                 &remoteRmaIov,
                 destAddr,
                 immDataForWrite);
+            if (posted != nullptr)
+            {
+                ++*posted;
+            }
 
             remoteOffset += localGroupSpan.byteSize();
         }

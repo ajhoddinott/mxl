@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <deque>
 #include <rdma/fabric.h>
 #include "AudioBounceBuffer.hpp"
 #include "DataLayout.hpp"
@@ -33,7 +34,7 @@ namespace mxl::lib::fabrics::ofi
 
         /** \copydoc EgressProtocol::processCompletion()
          */
-        virtual void processCompletion(Completion::Data const&) final;
+        virtual void processCompletion(Endpoint const& ep, Completion::Data const& completion, ::fi_addr_t destAddr) final;
 
         /** \copydoc EgressProtocol::hasPendingWork()
          */
@@ -92,12 +93,23 @@ namespace mxl::lib::fabrics::ofi
             SliceRange const& sliceRange, ::fi_addr_t destAddr = FI_ADDR_UNSPEC) final;
 
         /** \copydoc EgressProtocol::transferSamples()
+         * \note A transfer larger than the target's bounce buffer entry is split into entry-sized parts. Each part is posted once all earlier
+         * writes have completed, so parts arrive in order on any provider.
          */
         virtual void transferSamples(Endpoint const& ep, std::uint64_t headIndex, std::size_t count, ::fi_addr_t destAddr = FI_ADDR_UNSPEC) final;
 
         /** \copydoc EgressProtocol::processCompletion()
          */
-        virtual void processCompletion(Completion::Data const&) final;
+        virtual void processCompletion(Endpoint const& ep, Completion::Data const& completion, ::fi_addr_t destAddr = FI_ADDR_UNSPEC) final;
+
+        /** \copydoc EgressProtocol::processCompletionError()
+         * \note The failed part is not retried.
+         */
+        virtual void processCompletionError(Endpoint const& ep, ::fi_addr_t destAddr = FI_ADDR_UNSPEC) final;
+
+        /** \copydoc EgressProtocol::postQueued()
+         */
+        virtual void postQueued(Endpoint const& ep, ::fi_addr_t destAddr = FI_ADDR_UNSPEC) final;
 
         /** \copydoc EgressProtocol::hasPendingWork()
          */
@@ -105,15 +117,37 @@ namespace mxl::lib::fabrics::ofi
         virtual bool hasPendingWork() const final;
 
         /** \copydoc EgressProtocol::reset()
+         * \note Queued parts are dropped and not counted.
          */
         virtual std::size_t reset() final;
 
     private:
         friend class RMASampleEgressProtocolTemplate;
 
+        /** \brief A part of a transfer that has not been posted yet. */
+        struct QueuedPart
+        {
+            std::uint64_t headIndex;
+            std::size_t count;
+        };
+
     private:
         RMASampleEgressProtocol(Completion::Token token, TargetInfo info, DataLayout::Continuous dataLayout, LocalRegion _localRegion,
             std::size_t bounceBufferEntryCount);
+
+        /** \brief Post the writes for one part, which must fit in one bounce buffer entry.
+         * \param ep The endpoint to post on.
+         * \param headIndex The head index of the samples to write.
+         * \param count The number of samples per channel to write.
+         * \param destAddr The destination address. This is ignored for connection-oriented endpoints.
+         */
+        void postPart(Endpoint const& ep, std::uint64_t headIndex, std::size_t count, ::fi_addr_t destAddr);
+
+        /** \brief Count a write as no longer in flight and post the next queued part if possible.
+         * \param ep The endpoint to post on.
+         * \param destAddr The destination address. This is ignored for connection-oriented endpoints.
+         */
+        void writeCompleted(Endpoint const& ep, ::fi_addr_t destAddr);
 
         /** \brief Create the scatter-gather list for a given audio region and data layout. This will be used for the remote write transfer. The list
          * will be created based on the head index and count of samples to transfer.
@@ -139,6 +173,7 @@ namespace mxl::lib::fabrics::ofi
         std::size_t _pending = 0;
         std::uint32_t _bounceBufferEntryIndex{0};     /**< The index of the bounce buffer entry to use for the next transfer. */
         std::size_t _bounceBufferEntryCount; /**< The total number of bounce buffer entries. Used to wrap around the bounce buffer entry index. */
+        std::deque<QueuedPart> _queuedParts; /**< Parts not yet posted, oldest first. */
     };
 
     /** \brief Template for creating an Egress protocol for RMA writer endpoint to handles transferring audio data to remote targets using remote

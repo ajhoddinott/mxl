@@ -272,6 +272,7 @@ namespace mxl::lib::fabrics::ofi
          * \param remoteGroup Destination memory regions to write to
          * \param destAddr The destination address of the target endpoint. This is unused when using connected endpoints.
          * \param 64 bits of user data that will be available in the completion entry associated with this transfer.
+         * \param posted If not null, incremented for each write posted, so a caller can count the writes posted before one throws.
          * \return The number of requests posted to the endpoint work queue
          * \note  In this function, there will potentially be more than a single write transfer. This occurs if the IOV limit supported by the
          * endpoint is smaller than the number of local regions in the local region group. In that case, multiple writes are performed. This behavior
@@ -280,7 +281,7 @@ namespace mxl::lib::fabrics::ofi
          */
         [[nodiscard]]
         std::size_t write(Completion::Token token, LocalRegionGroup const& localGroup, RemoteRegion const& remote,
-            ::fi_addr_t destAddr = FI_ADDR_UNSPEC, std::optional<std::uint32_t> immData = std::nullopt) const;
+            ::fi_addr_t destAddr = FI_ADDR_UNSPEC, std::optional<std::uint32_t> immData = std::nullopt, std::size_t* posted = nullptr) const;
 
         /** \brief Push a recv work request to the endpoint work queue.
          *

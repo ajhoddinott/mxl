@@ -57,6 +57,10 @@ namespace mxl::lib::fabrics::ofi
          */
         void transferSamples(Endpoint const& ep, std::uint64_t headIndex, std::size_t count);
 
+        /** \brief Post queued transfers, if this target is activated.
+         */
+        void postQueued(Endpoint const& ep);
+
         /** \brief Returns true if there's pending work for this target.
          */
         [[nodiscard]]

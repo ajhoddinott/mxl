@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ProtocolEgressRMA.hpp"
+#include <algorithm>
 #include "AudioBounceBuffer.hpp"
 #include "DataLayout.hpp"
 #include "Exception.hpp"
@@ -82,7 +83,7 @@ namespace mxl::lib::fabrics::ofi
         throw Exception::invalidState("transferSamples is not supported in RMAGrainEgressProtocol.");
     }
 
-    void RMAGrainEgressProtocol::processCompletion(Completion::Data const&)
+    void RMAGrainEgressProtocol::processCompletion(Endpoint const&, Completion::Data const&, ::fi_addr_t)
     {
         --_pending;
     }
@@ -176,20 +177,56 @@ namespace mxl::lib::fabrics::ofi
 
     void RMASampleEgressProtocol::transferSamples(Endpoint const& ep, std::uint64_t headIndex, std::size_t count, ::fi_addr_t destAddr)
     {
-        if (count == 0)
+        if ((count == 0) || (count > _layout.bufferLength))
         {
-            throw Exception::invalidArgument("Count must be greater than 0.");
+            throw Exception::invalidArgument("Count must be greater than 0 and at most the ring length {}, got {}.", _layout.bufferLength, count);
         }
 
-        auto const entrySizeRequired = (_layout.sampleSize * _layout.channelCount * count) + sizeof(AudioEntryHeader);
-        if (entrySizeRequired > _remoteInfo.bounceBufferInfo->entrySize)
+        if (!_remoteInfo.bounceBufferInfo)
         {
-            throw Exception::invalidArgument("Count is too large for the bounce buffer entry size. Count {}, entry size {}, required entry size {}.",
-                count,
-                _remoteInfo.bounceBufferInfo->entrySize,
-                entrySizeRequired);
+            throw Exception::invalidState("Remote target does not have bounce buffer info required for sample egress protocol.");
+        }
+        auto const entrySize = _remoteInfo.bounceBufferInfo->entrySize;
+        auto const oneSampleSize = _layout.sampleSize * _layout.channelCount;
+        if (entrySize < sizeof(AudioEntryHeader) + oneSampleSize)
+        {
+            throw Exception::invalidArgument("The bounce buffer entry size {} cannot hold a single sample.", entrySize);
+        }
+        auto const maxCountPerEntry = (entrySize - sizeof(AudioEntryHeader)) / oneSampleSize;
+
+        // Reject splits starting before index 0: those samples never existed, and uint64 wrap-around does not map onto the ring.
+        if ((count > maxCountPerEntry) && (headIndex < count))
+        {
+            throw Exception::invalidArgument("Cannot split {} samples ending at index {}: a part would end before index 0.", count, headIndex);
         }
 
+        auto parts = std::deque<QueuedPart>{};
+        for (auto offset = std::size_t{0}; offset < count; offset += maxCountPerEntry)
+        {
+            auto const partCount = std::min<std::size_t>(maxCountPerEntry, count - offset);
+            parts.push_back({.headIndex = headIndex - count + offset + partCount, .count = partCount});
+        }
+
+        if ((_pending == 0) && _queuedParts.empty())
+        {
+            postPart(ep, parts.front().headIndex, parts.front().count, destAddr); // If this throws, nothing of this transfer is queued.
+            parts.pop_front();
+        }
+        _queuedParts.insert(_queuedParts.end(), parts.begin(), parts.end());
+    }
+
+    void RMASampleEgressProtocol::postQueued(Endpoint const& ep, ::fi_addr_t destAddr)
+    {
+        // Writes use FI_DELIVERY_COMPLETE: with none in flight, the target has every earlier part, so parts arrive in order on any provider.
+        if ((_pending == 0) && !_queuedParts.empty())
+        {
+            postPart(ep, _queuedParts.front().headIndex, _queuedParts.front().count, destAddr);
+            _queuedParts.pop_front(); // Only once posted, so a part whose post throws is retried.
+        }
+    }
+
+    void RMASampleEgressProtocol::postPart(Endpoint const& ep, std::uint64_t headIndex, std::size_t count, ::fi_addr_t destAddr)
+    {
         // 1- Create the scatter-gather list for the transfer and prepend the audio header.
         auto sgl = makeScatterGatherList(_layout, headIndex, count, _localRegion);
         // set the header and prepend it to the scatter-gather list.
@@ -201,24 +238,48 @@ namespace mxl::lib::fabrics::ofi
         auto const remoteRegion = _remoteInfo.remoteRegions[_bounceBufferEntryIndex % _remoteInfo.remoteRegions.size()];
 
         // 3- Send the remote write
-        _pending += ep.write(_token, sgl, remoteRegion, destAddr, _bounceBufferEntryIndex);
+        auto posted = std::size_t{0};
+        try
+        {
+            _pending += ep.write(_token, sgl, remoteRegion, destAddr, _bounceBufferEntryIndex, &posted);
+        }
+        catch (...)
+        {
+            _pending += posted; // Writes posted before the failure still complete; a retry waits for them.
+            throw;
+        }
 
         // 4- update bounce buffer entry index for the next transfer
         _bounceBufferEntryIndex = (_bounceBufferEntryIndex + 1) % _bounceBufferEntryCount;
     }
 
-    void RMASampleEgressProtocol::processCompletion(Completion::Data const&)
+    void RMASampleEgressProtocol::processCompletion(Endpoint const& ep, Completion::Data const&, ::fi_addr_t destAddr)
     {
-        --_pending;
+        writeCompleted(ep, destAddr);
+    }
+
+    void RMASampleEgressProtocol::processCompletionError(Endpoint const& ep, ::fi_addr_t destAddr)
+    {
+        writeCompleted(ep, destAddr);
+    }
+
+    void RMASampleEgressProtocol::writeCompleted(Endpoint const& ep, ::fi_addr_t destAddr)
+    {
+        if (_pending > 0)
+        {
+            --_pending;
+        }
+        postQueued(ep, destAddr);
     }
 
     bool RMASampleEgressProtocol::hasPendingWork() const
     {
-        return _pending > 0;
+        return (_pending > 0) || !_queuedParts.empty();
     }
 
     std::size_t RMASampleEgressProtocol::reset()
     {
+        _queuedParts.clear();
         return std::exchange(_pending, 0);
     }
 

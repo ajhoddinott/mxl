@@ -8,6 +8,7 @@
 #include <cstring>
 #include <algorithm>
 #include <random>
+#include <utility>
 #include <vector>
 #include <uuid.h>
 #include <catch2/catch_message.hpp>
@@ -682,6 +683,136 @@ TEST_CASE_PERSISTENT_FIXTURE(mxl::tests::mxlDomainFixture, "Fabrics: Transfer Sa
         mxlFabricsFreeTargetInfo(targetInfo);
     }
 
+    REQUIRE(mxlReleaseFlowReader(instance, reader) == MXL_STATUS_OK);
+    REQUIRE(mxlReleaseFlowWriter(instance, writer) == MXL_STATUS_OK);
+    REQUIRE(mxlFabricsDestroyInitiator(fabrics, initiator) == MXL_STATUS_OK);
+    REQUIRE(mxlFabricsDestroyTarget(fabrics, target) == MXL_STATUS_OK);
+    REQUIRE(mxlFabricsDestroyInstance(fabrics) == MXL_STATUS_OK);
+    REQUIRE(mxlDestroyInstance(instance) == MXL_STATUS_OK);
+}
+
+TEST_CASE_PERSISTENT_FIXTURE(mxl::tests::mxlDomainFixture, "Fabrics: Transfer Samples larger than the target bounce buffer entry",
+    "[Fabrics][Transfer][Flows][Sample]")
+{
+    auto instance = mxlCreateInstance(domain.c_str(), "");
+
+    mxlFabricsInstance fabrics;
+    REQUIRE(mxlFabricsCreateInstance(instance, nullptr, &fabrics) == MXL_STATUS_OK);
+
+    mxlFabricsTarget target;
+    REQUIRE(mxlFabricsCreateTarget(fabrics, &target) == MXL_STATUS_OK);
+
+    mxlFabricsInitiator initiator;
+    REQUIRE(mxlFabricsCreateInitiator(fabrics, &initiator) == MXL_STATUS_OK);
+
+    // The default sync batch size hint (480 samples at 48 kHz) sizes the target's bounce buffer entries.
+    auto flowDef = mxl::tests::readFile("../data/audio_flow.json");
+    auto const flowId = "b3bb5be7-9fe9-4324-a5bb-4c70e1084449";
+
+    mxlFlowWriter writer;
+    mxlFlowConfigInfo configInfo;
+    REQUIRE(mxlCreateFlowWriter(instance, flowDef.c_str(), nullptr, &writer, &configInfo, nullptr) == MXL_STATUS_OK);
+    REQUIRE(configInfo.common.maxSyncBatchSizeHint == 480);
+
+    mxlFlowReader reader;
+    REQUIRE(mxlCreateFlowReader(instance, flowId, "", &reader) == MXL_STATUS_OK);
+
+    auto const iface = mxlFabricsInterfaceConfig{
+        .version = MXL_FABRICS_API_VERSION,
+        .provider = MXL_FABRICS_PROVIDER_TCP,
+        .caps =
+            {
+                   .version = MXL_FABRICS_API_VERSION,
+                   .flags = MXL_FABRICS_IFACE_CAP_BLOCKING_OPERATIONS | MXL_FABRICS_IFACE_CAP_REMOTE_WRITE,
+                   .maxMessageSize = 0,
+                   },
+        .address = {.node = "127.0.0.1",                                  .service = nullptr                                                                                                          },
+        .attr = nullptr
+    };
+
+    auto targetConfig = mxlFabricsTargetConfig{.version = MXL_FABRICS_API_VERSION, .interface = iface, .writer = writer};
+    mxlFabricsTargetInfo targetInfo;
+    REQUIRE(mxlFabricsTargetSetup(target, &targetConfig, nullptr, &targetInfo) == MXL_STATUS_OK);
+
+    auto initiatorConfig = mxlFabricsInitiatorConfig{.version = MXL_FABRICS_API_VERSION, .interface = iface, .reader = reader};
+    REQUIRE(mxlFabricsInitiatorSetup(initiator, &initiatorConfig, nullptr) == MXL_STATUS_OK);
+    REQUIRE(mxlFabricsInitiatorAddTarget(initiator, targetInfo) == MXL_STATUS_OK);
+
+    std::uint64_t dummyIndex;
+    std::size_t dummyCount;
+    waitForConnection([&]() { mxlFabricsTargetReadSamplesNonBlocking(target, &dummyIndex, &dummyCount); },
+        [&]() { return mxlFabricsInitiatorMakeProgressNonBlocking(initiator); });
+
+    // Returns the (head index, count) pairs the target reports, in order.
+    auto transfer = [&](std::uint64_t headIndex, std::size_t count)
+    {
+        REQUIRE(mxlFabricsInitiatorTransferSamples(initiator, headIndex, count) == MXL_STATUS_OK);
+
+        auto received = std::vector<std::pair<std::uint64_t, std::size_t>>{};
+        auto receivedCount = std::size_t{0};
+        pollUntilSuccess(
+            [&]()
+            {
+                requireProgressStatus([&]() { return mxlFabricsInitiatorMakeProgressBlocking(initiator, BLOCKING_WAIT.count()); }, "initiator");
+
+                auto index = std::uint64_t{0};
+                auto n = std::size_t{0};
+                if (mxlFabricsTargetReadSamples(target, BLOCKING_WAIT.count(), &index, &n) == MXL_STATUS_OK)
+                {
+                    received.emplace_back(index, n);
+                    receivedCount += n;
+                }
+                return receivedCount >= count;
+            },
+            POLL_TIMEOUT,
+            "Transfer did not complete in 5 seconds");
+        return received;
+    };
+
+    SECTION("801 samples arrive as 480 then 321")
+    {
+        auto const received = transfer(801, 801);
+        REQUIRE(received == std::vector<std::pair<std::uint64_t, std::size_t>>{
+                                {480, 480},
+                                {801, 321}
+        });
+    }
+
+    SECTION("800 samples arrive as 480 then 320")
+    {
+        auto const received = transfer(800, 800);
+        REQUIRE(received == std::vector<std::pair<std::uint64_t, std::size_t>>{
+                                {480, 480},
+                                {800, 320}
+        });
+    }
+
+    SECTION("801 samples across the end of the ring arrive as 480 then 321")
+    {
+        // The second part covers samples 19435 to 19755, across the end of the 19456-sample ring.
+        REQUIRE(configInfo.continuous.bufferLength == 19456);
+        auto const received = transfer(19756, 801);
+        REQUIRE(received == std::vector<std::pair<std::uint64_t, std::size_t>>{
+                                {19435, 480},
+                                {19756, 321}
+        });
+    }
+
+    SECTION("a split transfer that would start before index 0 is rejected")
+    {
+        // The first part would end at index -321, which has no ring position.
+        REQUIRE(mxlFabricsInitiatorTransferSamples(initiator, 0, 801) == MXL_ERR_INVALID_ARG);
+        REQUIRE(mxlFabricsInitiatorMakeProgressNonBlocking(initiator) == MXL_STATUS_OK);
+    }
+
+    SECTION("a transfer larger than the source ring is rejected")
+    {
+        auto const count = std::size_t{configInfo.continuous.bufferLength} + 1;
+        REQUIRE(mxlFabricsInitiatorTransferSamples(initiator, 100000, count) == MXL_ERR_INVALID_ARG);
+        REQUIRE(mxlFabricsInitiatorMakeProgressNonBlocking(initiator) == MXL_STATUS_OK);
+    }
+
+    mxlFabricsFreeTargetInfo(targetInfo);
     REQUIRE(mxlReleaseFlowReader(instance, reader) == MXL_STATUS_OK);
     REQUIRE(mxlReleaseFlowWriter(instance, writer) == MXL_STATUS_OK);
     REQUIRE(mxlFabricsDestroyInitiator(fabrics, initiator) == MXL_STATUS_OK);

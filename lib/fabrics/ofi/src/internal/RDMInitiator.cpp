@@ -89,6 +89,14 @@ namespace mxl::lib::fabrics::ofi
         }
     }
 
+    void RDMInitiatorTarget::postQueued(Endpoint const& ep)
+    {
+        if (auto const state = std::get_if<Activated>(&_state); state != nullptr)
+        {
+            _proto->postQueued(ep, state->fiAddr);
+        }
+    }
+
     bool RDMInitiatorTarget::hasPendingWork() const noexcept
     {
         return std::visit(
@@ -100,18 +108,22 @@ namespace mxl::lib::fabrics::ofi
             _state);
     }
 
-    void RDMInitiatorTarget::handleCompletion(Endpoint&, Completion completion)
+    void RDMInitiatorTarget::handleCompletion(Endpoint& ep, Completion completion)
     {
         if (completion.isErrEntry())
         {
             MXL_ERROR("Completion error.");
+            if (auto const state = std::get_if<Activated>(&_state); state != nullptr)
+            {
+                _proto->processCompletionError(ep, state->fiAddr);
+            }
             return;
         }
 
         std::visit(
             overloaded{
                 [](Idle const&) {},
-                [&](Activated const&) { _proto->processCompletion(completion.data()); },
+                [&](Activated const& state) { _proto->processCompletion(ep, completion.data(), state.fiAddr); },
                 [](Done const&) {},
             },
             _state);
@@ -321,6 +333,7 @@ namespace mxl::lib::fabrics::ofi
         for (auto& [_, target] : _targets)
         {
             target.activate(_endpoint);
+            target.postQueued(_endpoint);
         }
     }
 
