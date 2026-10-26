@@ -388,7 +388,7 @@ public:
         }
         else if (mxlIsContinuousDataFormat(static_cast<int>(configInfo.common.format)))
         {
-            status = runContinuous(configInfo);
+            status = runContinuous();
         }
         else
         {
@@ -498,7 +498,7 @@ public:
         return MXL_STATUS_OK;
     }
 
-    mxlStatus runContinuous(mxlFlowConfigInfo const& configInfo)
+    mxlStatus runContinuous()
     {
         mxlWrappedMultiBufferSlice payload;
 
@@ -506,20 +506,24 @@ public:
         mxlFlowReaderGetRuntimeInfo(_reader, &runtimeInfo);
         std::uint64_t headIndex = runtimeInfo.headIndex;
         auto previousHeadIndex = std::uint64_t{0};
-        std::size_t batchSize = configInfo.common.maxSyncBatchSizeHint;
-        MXL_INFO("batch size in samples: {}", batchSize);
         auto stats = TransferStats{};
+
+        // We are too late.. time travel to the last headIndex commited!
+        auto const timeTravel = [&]()
+        {
+            mxlFlowReaderGetRuntimeInfo(_reader, &runtimeInfo);
+            previousHeadIndex = headIndex;
+            headIndex = runtimeInfo.headIndex;
+            MXL_INFO("Too late! previous headIndex={}  new headIndex={}", previousHeadIndex, headIndex);
+        };
 
         while (!g_exit_requested)
         {
-            auto status = mxlFlowReaderGetSamples(_reader, headIndex, batchSize, 200000000, &payload);
+            // Wait for the first sample not yet sent, then send everything committed up to the flow's head.
+            auto status = mxlFlowReaderGetSamples(_reader, headIndex + 1, 1, 200000000, &payload);
             if (status == MXL_ERR_OUT_OF_RANGE_TOO_LATE)
             {
-                // We are too late.. time travel to the last headIndex commited!
-                mxlFlowReaderGetRuntimeInfo(_reader, &runtimeInfo);
-                previousHeadIndex = headIndex;
-                headIndex = runtimeInfo.headIndex;
-                MXL_INFO("Too late! previous headIndex={}  new headIndex={}", previousHeadIndex, headIndex);
+                timeTravel();
                 continue;
             }
             if (status == MXL_ERR_OUT_OF_RANGE_TOO_EARLY)
@@ -541,7 +545,15 @@ public:
             }
 
             // Okay the samples are ready, we can transfer it to the targets.
-            status = mxlFabricsInitiatorTransferSamples(_initiator, headIndex, batchSize);
+            mxlFlowReaderGetRuntimeInfo(_reader, &runtimeInfo);
+            auto const count = runtimeInfo.headIndex - headIndex;
+            if (mxlFlowReaderGetSamplesNonBlocking(_reader, runtimeInfo.headIndex, count, &payload) == MXL_ERR_OUT_OF_RANGE_TOO_LATE)
+            {
+                // The head moved on too far since the read above.
+                timeTravel();
+                continue;
+            }
+            status = mxlFabricsInitiatorTransferSamples(_initiator, runtimeInfo.headIndex, count);
             if (status == MXL_ERR_NOT_READY)
             {
                 status = mxlFabricsInitiatorMakeProgressNonBlocking(_initiator);
@@ -570,15 +582,14 @@ public:
                 }
             }
             while (status == MXL_ERR_NOT_READY && deadline > std::chrono::steady_clock::now());
-            MXL_DEBUG("Transferred samples headIndex={} count={}", headIndex, batchSize);
-            stats.record(batchSize);
+            MXL_DEBUG("Transferred samples headIndex={} count={}", runtimeInfo.headIndex, count);
+            stats.record(count);
             stats.maybeLog("transfers", "samples");
 
             previousHeadIndex = headIndex;
 
             // If we get here, we have transfered the samples, we can work on the next samples.
-            headIndex += batchSize;
-            mxlSleepForNs(mxlGetNsUntilIndex(headIndex, &configInfo.common.grainRate));
+            headIndex = runtimeInfo.headIndex;
         }
 
         return MXL_STATUS_OK;
