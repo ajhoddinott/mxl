@@ -59,6 +59,18 @@ namespace mxl::lib::fabrics::ofi
             _state);
     }
 
+    bool RCInitiatorEndpoint::hasPendingTransfers() const noexcept
+    {
+        // A flushing endpoint has already reset its protocol, but its writes may still complete.
+        return _proto->hasPendingWork() || std::holds_alternative<Flushing>(_state);
+    }
+
+    void RCInitiatorEndpoint::setProtocol(std::unique_ptr<EgressProtocol> proto) noexcept
+    {
+        proto->continueFrom(*_proto);
+        _proto = std::move(proto);
+    }
+
     void RCInitiatorEndpoint::shutdown()
     {
         _state = std::visit(
@@ -329,6 +341,25 @@ namespace mxl::lib::fabrics::ofi
         proto->registerMemory(_domain);
 
         _targets.emplace(id, RCInitiatorEndpoint{std::move(endpoint), std::move(proto), targetInfo});
+    }
+
+    void RCInitiator::setRegions(MxlRegions const& regions)
+    {
+        if (std::ranges::any_of(_targets, [](auto const& item) { return item.second.hasPendingTransfers(); }))
+        {
+            throw Exception::make(MXL_ERR_NOT_READY, "Cannot change regions while transfers are pending.");
+        }
+
+        auto proto = selectEgressProtocol(regions.dataLayout(), regions.regions());
+        _domain->clearRegions();
+        proto->registerMemory(_domain);
+        for (auto& [token, target] : _targets)
+        {
+            auto instance = proto->createInstance(token, target.info());
+            instance->registerMemory(_domain);
+            target.setProtocol(std::move(instance));
+        }
+        _proto = std::move(proto);
     }
 
     void RCInitiator::removeTarget(TargetInfo const& targetInfo)

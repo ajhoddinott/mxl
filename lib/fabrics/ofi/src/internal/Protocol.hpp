@@ -117,6 +117,12 @@ namespace mxl::lib::fabrics::ofi
         virtual void postQueued([[maybe_unused]] Endpoint const& ep, [[maybe_unused]] ::fi_addr_t destAddr = FI_ADDR_UNSPEC)
         {}
 
+        /** \brief Continue from the state of the protocol this one replaces for the same target.
+         * \param previous The protocol being replaced.
+         */
+        virtual void continueFrom([[maybe_unused]] EgressProtocol const& previous) noexcept
+        {}
+
         /** \brief Check if there is uncompleted requests.
          */
         [[nodiscard]]

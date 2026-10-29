@@ -48,6 +48,12 @@ namespace mxl::lib::fabrics::ofi
          */
         void shutdown(Endpoint& ep);
 
+        /** \brief Stop tracking this target's transfers.
+         * \return The number of writes still in flight.
+         */
+        [[nodiscard]]
+        std::size_t resetProtocol();
+
         /** \brief Post a grain data transfer request to this endpoint.
          */
         void transferGrain(Endpoint const& ep, std::uint64_t localIndex, std::uint64_t remoteIndex, std::uint64_t remotePayloadOffset,
@@ -65,6 +71,20 @@ namespace mxl::lib::fabrics::ofi
          */
         [[nodiscard]]
         bool hasPendingWork() const noexcept;
+
+        /** \brief Get the target info of the remote endpoint.
+         */
+        [[nodiscard]]
+        TargetInfo const& info() const noexcept;
+
+        /** \brief Returns true while writes posted to this target may still be in flight.
+         */
+        [[nodiscard]]
+        bool hasPendingTransfers() const noexcept;
+
+        /** \brief Replace the egress protocol. Only valid while hasPendingTransfers() returns false.
+         */
+        void setProtocol(std::unique_ptr<EgressProtocol> proto) noexcept;
 
         /** \brief Handle a completion event for this endpoint.
          */
@@ -123,6 +143,10 @@ namespace mxl::lib::fabrics::ofi
         /** \copydoc Initiator::removeTarget()
          */
         virtual void removeTarget(TargetInfo const& remoteTargetInfo) final;
+
+        /** \copydoc Initiator::setRegions()
+         */
+        virtual void setRegions(MxlRegions const& regions) final;
 
         virtual void shutdown() final;
 
@@ -205,5 +229,8 @@ namespace mxl::lib::fabrics::ofi
         /** Targets managed by this initiator. Each target has its own remote address and remote memory regions. */
         std::map<Completion::Token, RDMInitiatorTarget> _targets{};
         std::map<Endpoint::Id, Completion::Token> _remoteEndpoints{};
+
+        /** Writes of removed targets that have not completed yet. */
+        std::size_t _removedTargetWrites{0};
     };
 }

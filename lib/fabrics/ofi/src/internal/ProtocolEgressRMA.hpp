@@ -111,6 +111,11 @@ namespace mxl::lib::fabrics::ofi
          */
         virtual void postQueued(Endpoint const& ep, ::fi_addr_t destAddr = FI_ADDR_UNSPEC) final;
 
+        /** \copydoc EgressProtocol::continueFrom()
+         * \note Continues at the previous protocol's bounce buffer entry, so entries the target has not read yet are not overwritten.
+         */
+        virtual void continueFrom(EgressProtocol const& previous) noexcept final;
+
         /** \copydoc EgressProtocol::hasPendingWork()
          */
         [[nodiscard]]

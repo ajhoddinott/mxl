@@ -5,7 +5,10 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+#include "DataLayout.hpp"
 #include "Endpoint.hpp"
+#include "Region.hpp"
 #include "TargetInfo.hpp"
 
 namespace mxl::lib::fabrics::ofi
@@ -43,6 +46,12 @@ namespace mxl::lib::fabrics::ofi
          * This is a non-blocking operation. The target is only removed after makeProgress() or makeProgressBlocking() returns false.
          */
         virtual void removeTarget(TargetInfo const& targetInfo) = 0;
+
+        /** \brief Transfer from new local memory with the same data layout, keeping all targets connected.
+         *
+         * Throws an Exception with MXL_ERR_NOT_READY while transfers are pending. If anything else is thrown, the initiator can no longer be used.
+         */
+        virtual void setRegions(MxlRegions const& regions) = 0;
 
         /** \brief Transfer a grain to all targets.
          *
@@ -138,6 +147,11 @@ namespace mxl::lib::fabrics::ofi
          */
         void removeTarget(TargetInfo const& targetInfo);
 
+        /** \brief Transfer from a new flow reader, whose flow must have the same data layout as the one the initiator was set up with.
+         * \see Initiator::setRegions()
+         */
+        void setReader(mxlFlowReader reader);
+
         /** \copydoc Initiator::transferGrain()
          */
         void transferGrain(std::uint64_t grainIndex, std::uint16_t startSlice, std::uint16_t endSlice);
@@ -161,5 +175,6 @@ namespace mxl::lib::fabrics::ofi
 
     private:
         std::unique_ptr<Initiator> _inner; /**< The underlying initiator implementation. */
+        std::optional<DataLayout> _layout; /**< The data layout of the flow the initiator was set up with. */
     };
 }

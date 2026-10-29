@@ -56,6 +56,12 @@ namespace mxl::lib::fabrics::ofi
          */
         void registerRegion(Region const& region, std::uint64_t access);
 
+        /** \brief Deregister all memory regions registered to this domain.
+         *
+         * No operation using any of these regions may still be in flight.
+         */
+        void clearRegions() noexcept;
+
         /** \brief Get the local regions associated to the registered regions to this domain.
          *
          * If no regions was registered previously, this will

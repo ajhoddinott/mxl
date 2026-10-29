@@ -6,6 +6,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <algorithm>
 #include <memory>
 #include <utility>
 #include <variant>
@@ -108,6 +109,27 @@ namespace mxl::lib::fabrics::ofi
             _state);
     }
 
+    std::size_t RDMInitiatorTarget::resetProtocol()
+    {
+        return _proto->reset();
+    }
+
+    TargetInfo const& RDMInitiatorTarget::info() const noexcept
+    {
+        return _remoteInfo;
+    }
+
+    bool RDMInitiatorTarget::hasPendingTransfers() const noexcept
+    {
+        return _proto->hasPendingWork();
+    }
+
+    void RDMInitiatorTarget::setProtocol(std::unique_ptr<EgressProtocol> proto) noexcept
+    {
+        proto->continueFrom(*_proto);
+        _proto = std::move(proto);
+    }
+
     void RDMInitiatorTarget::handleCompletion(Endpoint& ep, Completion completion)
     {
         if (completion.isErrEntry())
@@ -193,10 +215,32 @@ namespace mxl::lib::fabrics::ofi
         _targets.emplace(token, RDMInitiatorTarget(std::move(proto), targetInfo));
     }
 
+    void RDMInitiator::setRegions(MxlRegions const& regions)
+    {
+        if ((_removedTargetWrites > 0) || std::ranges::any_of(_targets, [](auto const& item) { return item.second.hasPendingTransfers(); }))
+        {
+            throw Exception::make(MXL_ERR_NOT_READY, "Cannot change regions while transfers are pending.");
+        }
+
+        auto const domain = _endpoint.domain();
+        auto proto = selectEgressProtocol(regions.dataLayout(), regions.regions());
+        domain->clearRegions();
+        proto->registerMemory(domain);
+        for (auto& [token, target] : _targets)
+        {
+            auto instance = proto->createInstance(token, target.info());
+            instance->registerMemory(domain);
+            target.setProtocol(std::move(instance));
+        }
+        _proto = std::move(proto);
+    }
+
     void RDMInitiator::removeTarget(TargetInfo const& targetInfo)
     {
         auto& remote = findRemoteByEndpoint(targetInfo.id);
         remote.shutdown(_endpoint);
+        // The target is dropped now, but its writes still complete later and read the registered memory until then.
+        _removedTargetWrites += remote.resetProtocol();
         _targets.erase(_remoteEndpoints.extract(targetInfo.id).mapped());
     }
 
@@ -292,6 +336,11 @@ namespace mxl::lib::fabrics::ofi
 
     Initiator::MakeProgressResult RDMInitiator::afterProgressResult() const noexcept
     {
+        if (_removedTargetWrites > 0)
+        {
+            return Initiator::NotReady{};
+        }
+
         for (auto const& [_, remote] : _targets)
         {
             if (remote.hasPendingWork())
@@ -342,6 +391,7 @@ namespace mxl::lib::fabrics::ofi
         auto it = _targets.find(completion.token());
         if (it == _targets.end())
         {
+            _removedTargetWrites -= (_removedTargetWrites > 0) ? 1 : 0;
             MXL_ERROR("Dropping completion for unknown target.");
             return;
         }

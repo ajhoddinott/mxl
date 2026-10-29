@@ -36,6 +36,23 @@ namespace mxl::lib::fabrics::ofi
             case FI_EP_RDM: _inner = RDMInitiator::setup(config, info.view()); break;
             default:        throw Exception::invalidState("unsupported endpoint type");
         }
+        _layout = MxlRegions::forReader(config.reader).dataLayout();
+    }
+
+    void InitiatorWrapper::setReader(mxlFlowReader reader)
+    {
+        if (!_inner || !_layout)
+        {
+            throw Exception::invalidState("Initiator is not set up");
+        }
+
+        auto const regions = MxlRegions::forReader(reader);
+        if (regions.dataLayout() != *_layout)
+        {
+            throw Exception::invalidArgument("The flow's data layout differs from the one the initiator was set up with.");
+        }
+
+        _inner->setRegions(regions);
     }
 
     void InitiatorWrapper::addTarget(TargetInfo const& targetInfo)

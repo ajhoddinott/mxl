@@ -272,6 +272,14 @@ namespace mxl::lib::fabrics::ofi
         postQueued(ep, destAddr);
     }
 
+    void RMASampleEgressProtocol::continueFrom(EgressProtocol const& previous) noexcept
+    {
+        if (auto const* sample = dynamic_cast<RMASampleEgressProtocol const*>(&previous); sample != nullptr)
+        {
+            _bounceBufferEntryIndex = sample->_bounceBufferEntryIndex;
+        }
+    }
+
     bool RMASampleEgressProtocol::hasPendingWork() const
     {
         return (_pending > 0) || !_queuedParts.empty();

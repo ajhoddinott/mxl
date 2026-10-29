@@ -308,6 +308,18 @@ extern "C"
     mxlStatus mxlFabricsInitiatorRemoveTarget(mxlFabricsInitiator in_initiator, mxlFabricsTargetInfo in_targetInfo);
 
     /**
+     * Transfer from a new flow reader, for example after the flow was recreated by its writer. Targets stay connected. The reader the initiator
+     * was using may be released first, and must be if the new one comes from the same instance, which would otherwise return it again. No
+     * transfer may be started in between.
+     * \param in_initiator A valid fabrics initiator
+     * \param in_reader A valid flow reader. Its flow must have the same data layout as the flow the initiator was set up with.
+     * \return MXL_ERR_NOT_READY while transfers are pending: call mxlFabricsInitiatorMakeProgress*() and retry. MXL_ERR_INVALID_ARG if the
+     * data layout differs. After any other error the initiator can no longer be used. \see mxlStatus
+     */
+    MXL_EXPORT
+    mxlStatus mxlFabricsInitiatorSetReader(mxlFabricsInitiator in_initiator, mxlFlowReader in_reader);
+
+    /**
      * Enqueue a transfer operation to all added targets. This function is always non-blocking. The transfer operation might be started right
      * away, but is only guaranteed to have completed after mxlFabricsInitiatorMakeProgress*() no longer returns MXL_ERR_NOT_READY.
      * \param in_initiator A valid fabrics initiator

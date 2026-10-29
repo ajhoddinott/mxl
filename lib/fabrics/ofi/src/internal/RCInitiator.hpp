@@ -41,6 +41,15 @@ namespace mxl::lib::fabrics::ofi
         [[nodiscard]]
         bool hasPendingWork() const noexcept;
 
+        /** \brief Returns true while writes posted from this endpoint may still be in flight.
+         */
+        [[nodiscard]]
+        bool hasPendingTransfers() const noexcept;
+
+        /** \brief Replace the egress protocol. Only valid while hasPendingTransfers() returns false.
+         */
+        void setProtocol(std::unique_ptr<EgressProtocol> proto) noexcept;
+
         /** \brief Returns true if the endpoint is idle and could be actived.
          */
         [[nodiscard]]
@@ -183,6 +192,10 @@ namespace mxl::lib::fabrics::ofi
         /** \copydoc Initiator::removeTarget()
          */
         virtual void removeTarget(TargetInfo const& targetInfo) final;
+
+        /** \copydoc Initiator::setRegions()
+         */
+        virtual void setRegions(MxlRegions const& regions) final;
 
         /** \copydoc Initiator::transferGrain()
          */

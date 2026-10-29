@@ -40,6 +40,8 @@ namespace mxl::lib::fabrics::ofi
              */
             [[nodiscard]]
             std::uint32_t planePayloadOffset(std::size_t planeIndex, std::uint32_t grainPayloadOffset) const;
+
+            bool operator==(Discrete const&) const = default;
         };
 
         /** \brief Continuous layout variant of DataLayout.
@@ -49,6 +51,8 @@ namespace mxl::lib::fabrics::ofi
             std::size_t sampleSize;   /**< Size of each audio sample in bytes. */
             std::size_t channelCount; /**< Number of audio channels. */
             std::size_t bufferLength; /**< The number of samples per channel. */
+
+            bool operator==(Continuous const&) const = default;
         };
 
     public:
@@ -93,6 +97,8 @@ namespace mxl::lib::fabrics::ofi
          */
         [[nodiscard]]
         Continuous const& asContinuous() const;
+
+        bool operator==(DataLayout const&) const = default;
 
     private:
         using InnerLayout = std::variant<Discrete, Continuous>;

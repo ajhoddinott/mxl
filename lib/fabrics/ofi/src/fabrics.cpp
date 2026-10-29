@@ -461,6 +461,36 @@ mxlStatus mxlFabricsInitiatorRemoveTarget(mxlFabricsInitiator in_initiator, mxlF
 }
 
 extern "C" MXL_EXPORT
+mxlStatus mxlFabricsInitiatorSetReader(mxlFabricsInitiator in_initiator, mxlFlowReader in_reader)
+{
+    if ((in_initiator == nullptr) || (in_reader == nullptr))
+    {
+        return MXL_ERR_INVALID_ARG;
+    }
+
+    return ofi::try_run(
+        [&]()
+        {
+            try
+            {
+                ofi::InitiatorWrapper::fromAPI(in_initiator)->setReader(in_reader);
+            }
+            catch (ofi::Exception const& e)
+            {
+                // Pending transfers are an expected answer that the caller retries, not an error to log.
+                if (e.status() == MXL_ERR_NOT_READY)
+                {
+                    return MXL_ERR_NOT_READY;
+                }
+                throw;
+            }
+
+            return MXL_STATUS_OK;
+        },
+        "Failed to set initiator reader");
+}
+
+extern "C" MXL_EXPORT
 mxlStatus mxlFabricsInitiatorTransferGrain(mxlFabricsInitiator in_initiator, uint64_t in_grainIndex, uint16_t in_startSlice, uint16_t in_endSlice)
 {
     if (in_initiator == nullptr)

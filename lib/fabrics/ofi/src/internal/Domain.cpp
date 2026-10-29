@@ -54,6 +54,11 @@ namespace mxl::lib::fabrics::ofi
         _registeredRegions.push_back(registerRegionImpl(region, access));
     }
 
+    void Domain::clearRegions() noexcept
+    {
+        _registeredRegions.clear();
+    }
+
     std::vector<LocalRegion> Domain::localRegions() const noexcept
     {
         return toLocal(_registeredRegions);

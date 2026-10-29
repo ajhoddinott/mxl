@@ -9,6 +9,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <uuid.h>
 #include <sys/types.h>
@@ -374,27 +375,50 @@ public:
 
     mxlStatus run()
     {
-        mxlFlowConfigInfo configInfo;
-        auto status = mxlFlowReaderGetConfigInfo(_reader, &configInfo);
-        if (status != MXL_STATUS_OK)
+        mxlStatus status;
+        auto firstRate = std::optional<mxlRational>{};
+        do
         {
-            MXL_ERROR("Failed to get flow info with status '{}'", static_cast<int>(status));
-            return status;
-        }
+            // Read for every run: a flow recreated by its writer may come back with a different configuration.
+            mxlFlowConfigInfo configInfo;
+            status = mxlFlowReaderGetConfigInfo(_reader, &configInfo);
+            if (status != MXL_STATUS_OK)
+            {
+                MXL_ERROR("Failed to get flow info with status '{}'", static_cast<int>(status));
+                return status;
+            }
 
-        if (mxlIsDiscreteDataFormat(static_cast<int>(configInfo.common.format)))
-        {
-            status = runDiscrete(configInfo);
+            auto const rate = configInfo.common.grainRate;
+            if (!firstRate)
+            {
+                firstRate = rate;
+            }
+            else if ((rate.numerator != firstRate->numerator) || (rate.denominator != firstRate->denominator))
+            {
+                // The target's flow keeps the rate it was created with, so it cannot follow a flow recreated at another rate.
+                MXL_ERROR("The recreated flow's grain rate {}/{} differs from {}/{}",
+                    rate.numerator,
+                    rate.denominator,
+                    firstRate->numerator,
+                    firstRate->denominator);
+                return MXL_ERR_INVALID_ARG;
+            }
+
+            if (mxlIsDiscreteDataFormat(static_cast<int>(configInfo.common.format)))
+            {
+                status = runDiscrete(configInfo);
+            }
+            else if (mxlIsContinuousDataFormat(static_cast<int>(configInfo.common.format)))
+            {
+                status = runContinuous();
+            }
+            else
+            {
+                MXL_ERROR("Unsupported data format {}", configInfo.common.format);
+                return MXL_ERR_INVALID_ARG;
+            }
         }
-        else if (mxlIsContinuousDataFormat(static_cast<int>(configInfo.common.format)))
-        {
-            status = runContinuous();
-        }
-        else
-        {
-            MXL_ERROR("Unsupported data format {}", configInfo.common.format);
-            return MXL_ERR_INVALID_ARG;
-        }
+        while ((status == MXL_ERR_FLOW_INVALID) && ((status = reattach()) == MXL_STATUS_OK) && !g_exit_requested);
 
         return status;
     }
@@ -431,6 +455,11 @@ public:
             {
                 // No grains available before a timeout was triggered.. most likely a problem upstream.
                 continue;
+            }
+            else if (status == MXL_ERR_FLOW_INVALID)
+            {
+                // The writer recreated the flow: run() reattaches and starts again.
+                return status;
             }
             else if (status != MXL_STATUS_OK)
             {
@@ -536,6 +565,11 @@ public:
                 // No grains available before a timeout was triggered.. most likely a problem upstream.
                 continue;
             }
+            if (status == MXL_ERR_FLOW_INVALID)
+            {
+                // The writer recreated the flow: run() reattaches and starts again.
+                return status;
+            }
             if (status != MXL_STATUS_OK)
             {
                 // Something  unexpected occured, not much we can do, but log and retry
@@ -596,6 +630,54 @@ public:
     }
 
 private:
+    // Reopen the flow after its writer recreated it, keeping the targets connected.
+    mxlStatus reattach()
+    {
+        // Transfers read from the reader's memory, so they must all complete before it is released.
+        auto status = MXL_ERR_NOT_READY;
+        while (((status == MXL_ERR_NOT_READY) || (status == MXL_ERR_INTERRUPTED)) && !g_exit_requested)
+        {
+            status = makeProgress(std::chrono::milliseconds(10));
+        }
+        if (g_exit_requested)
+        {
+            return MXL_STATUS_OK;
+        }
+        if (status != MXL_STATUS_OK)
+        {
+            MXL_ERROR("Failed to complete transfers before reattaching with status '{}'", static_cast<int>(status));
+            return status;
+        }
+
+        // Release first: the instance would otherwise return this reader again for the same flow id.
+        auto const flowId = uuids::to_string(_config.flowParser.getId());
+        MXL_INFO("Flow {} was recreated by its writer, reattaching", flowId);
+        mxlReleaseFlowReader(_instance, _reader);
+        _reader = nullptr;
+        while ((status = mxlCreateFlowReader(_instance, flowId.c_str(), "", &_reader)) == MXL_ERR_FLOW_NOT_FOUND)
+        {
+            if (g_exit_requested)
+            {
+                return MXL_STATUS_OK;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        if (status != MXL_STATUS_OK)
+        {
+            MXL_ERROR("Failed to reopen flow reader with status '{}'", static_cast<int>(status));
+            return status;
+        }
+
+        status = mxlFabricsInitiatorSetReader(_initiator, _reader);
+        if (status != MXL_STATUS_OK)
+        {
+            MXL_ERROR("Failed to set the initiator's reader with status '{}'", static_cast<int>(status));
+            return status;
+        }
+        MXL_INFO("Reattached to flow {}", flowId);
+        return MXL_STATUS_OK;
+    }
+
     mxlStatus makeProgress(std::chrono::steady_clock::duration timeout)
     {
         if ((_config.interface.caps.flags & MXL_FABRICS_IFACE_CAP_BLOCKING_OPERATIONS) != 0)

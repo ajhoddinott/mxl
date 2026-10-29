@@ -22,6 +22,7 @@
 
 #ifdef MXL_FABRICS_OFI
 // clang-format off
+    #include "AudioBounceBuffer.hpp"
     #include "TargetInfo.hpp"
 // clang-format on
 #else
@@ -818,6 +819,235 @@ TEST_CASE_PERSISTENT_FIXTURE(mxl::tests::mxlDomainFixture, "Fabrics: Transfer Sa
     REQUIRE(mxlFabricsDestroyInitiator(fabrics, initiator) == MXL_STATUS_OK);
     REQUIRE(mxlFabricsDestroyTarget(fabrics, target) == MXL_STATUS_OK);
     REQUIRE(mxlFabricsDestroyInstance(fabrics) == MXL_STATUS_OK);
+    REQUIRE(mxlDestroyInstance(instance) == MXL_STATUS_OK);
+}
+
+TEST_CASE_PERSISTENT_FIXTURE(mxl::tests::mxlDomainFixture, "Fabrics: Initiator transfers from a recreated flow", "[Fabrics][Transfer][Flows][Sample]")
+{
+    auto instance = mxlCreateInstance(domain.c_str(), "");
+    // The source flow's writer has its own instance, as it would be in another process.
+    auto sourceInstance = mxlCreateInstance(domain.c_str(), "");
+    // The new reader comes from another instance, so it can be opened while the old one is still mapped.
+    auto newReaderInstance = mxlCreateInstance(domain.c_str(), "");
+
+    mxlFabricsInstance fabrics;
+    REQUIRE(mxlFabricsCreateInstance(instance, nullptr, &fabrics) == MXL_STATUS_OK);
+
+    mxlFabricsTarget target;
+    REQUIRE(mxlFabricsCreateTarget(fabrics, &target) == MXL_STATUS_OK);
+
+    mxlFabricsInitiator initiator;
+    REQUIRE(mxlFabricsCreateInitiator(fabrics, &initiator) == MXL_STATUS_OK);
+
+    // The target writes to its own flow, with the same layout, so that recreating the source flow does not affect it.
+    auto const sourceDef = mxl::tests::readFile("../data/audio_flow.json");
+    auto const sourceId = std::string{"b3bb5be7-9fe9-4324-a5bb-4c70e1084449"};
+    auto const targetId = std::string{"3e4f0d6a-7c55-4b8e-9a51-2f7c86d1b0e3"};
+    auto targetDef = sourceDef;
+    targetDef.replace(targetDef.find(sourceId), sourceId.size(), targetId);
+
+    mxlFlowWriter sourceWriter;
+    REQUIRE(mxlCreateFlowWriter(sourceInstance, sourceDef.c_str(), nullptr, &sourceWriter, nullptr, nullptr) == MXL_STATUS_OK);
+    mxlFlowReader reader;
+    REQUIRE(mxlCreateFlowReader(instance, sourceId.c_str(), "", &reader) == MXL_STATUS_OK);
+
+    mxlFlowWriter targetWriter;
+    REQUIRE(mxlCreateFlowWriter(instance, targetDef.c_str(), nullptr, &targetWriter, nullptr, nullptr) == MXL_STATUS_OK);
+    mxlFlowReader targetReader;
+    REQUIRE(mxlCreateFlowReader(instance, targetId.c_str(), "", &targetReader) == MXL_STATUS_OK);
+
+    // Writes count samples up to head index into every channel, all bytes set to value.
+    auto writeSamples = [](mxlFlowWriter writer, std::uint64_t index, std::size_t count, std::uint8_t value)
+    {
+        mxlMutableWrappedMultiBufferSlice slices;
+        REQUIRE(mxlFlowWriterOpenSamples(writer, index, count, &slices) == MXL_STATUS_OK);
+        for (auto channel = std::size_t{0}; channel < slices.count; ++channel)
+        {
+            for (auto const& fragment : slices.base.fragments)
+            {
+                std::memset(static_cast<std::uint8_t*>(fragment.pointer) + (channel * slices.stride), value, fragment.size);
+            }
+        }
+        REQUIRE(mxlFlowWriterCommitSamples(writer) == MXL_STATUS_OK);
+    };
+
+    // Transfers count samples up to head index, then checks that every byte of them arrived in the target's flow as value.
+    auto transferAndCheck = [&](std::uint64_t index, std::size_t count, std::uint8_t value)
+    {
+        std::uint64_t dummyIndex;
+        std::size_t dummyCount;
+        waitForTransferStart([&]() { mxlFabricsTargetReadSamplesNonBlocking(target, &dummyIndex, &dummyCount); },
+            [&]() { requireProgressStatus([&]() { return mxlFabricsInitiatorMakeProgressNonBlocking(initiator); }, "initiator"); },
+            [&]() { return mxlFabricsInitiatorTransferSamples(initiator, index, count); });
+        pollUntilSuccess(
+            [&]()
+            {
+                requireProgressStatus([&]() { return mxlFabricsInitiatorMakeProgressBlocking(initiator, BLOCKING_WAIT.count()); }, "initiator");
+                auto headIndex = std::uint64_t{0};
+                auto n = std::size_t{0};
+                return (mxlFabricsTargetReadSamples(target, BLOCKING_WAIT.count(), &headIndex, &n) == MXL_STATUS_OK) && (headIndex == index);
+            },
+            POLL_TIMEOUT,
+            "Transfer did not complete in 5 seconds");
+        pollUntilSuccess([&]() { return mxlFabricsInitiatorMakeProgressNonBlocking(initiator) == MXL_STATUS_OK; },
+            POLL_TIMEOUT,
+            "Initiator did not complete in 5 seconds");
+
+        // The samples are in the target's flow; committing makes them readable, as a target application does.
+        mxlMutableWrappedMultiBufferSlice dummy;
+        REQUIRE(mxlFlowWriterOpenSamples(targetWriter, index, count, &dummy) == MXL_STATUS_OK);
+        REQUIRE(mxlFlowWriterCommitSamples(targetWriter) == MXL_STATUS_OK);
+
+        mxlWrappedMultiBufferSlice slices;
+        REQUIRE(mxlFlowReaderGetSamplesNonBlocking(targetReader, index, count, &slices) == MXL_STATUS_OK);
+        for (auto channel = std::size_t{0}; channel < slices.count; ++channel)
+        {
+            for (auto const& fragment : slices.base.fragments)
+            {
+                auto const* bytes = static_cast<std::uint8_t const*>(fragment.pointer) + (channel * slices.stride);
+                REQUIRE(std::all_of(bytes, bytes + fragment.size, [&](std::uint8_t b) { return b == value; }));
+            }
+        }
+    };
+
+    // Recreates the source flow and switches the initiator to a reader of the new one.
+    auto recreateSource = [&]()
+    {
+        // Releasing the last writer deletes the flow; recreating it gives new memory at the same path.
+        REQUIRE(mxlReleaseFlowWriter(sourceInstance, sourceWriter) == MXL_STATUS_OK);
+        REQUIRE(mxlCreateFlowWriter(sourceInstance, sourceDef.c_str(), nullptr, &sourceWriter, nullptr, nullptr) == MXL_STATUS_OK);
+        mxlWrappedMultiBufferSlice dummySlices;
+        REQUIRE(mxlFlowReaderGetSamplesNonBlocking(reader, 1100, 100, &dummySlices) == MXL_ERR_FLOW_INVALID);
+
+        // Opened before the old reader is released, so the new flow cannot be mapped at the old one's address.
+        mxlFlowReader newReader;
+        REQUIRE(mxlCreateFlowReader(newReaderInstance, sourceId.c_str(), "", &newReader) == MXL_STATUS_OK);
+        REQUIRE(mxlFabricsInitiatorSetReader(initiator, newReader) == MXL_STATUS_OK);
+        REQUIRE(mxlReleaseFlowReader(instance, reader) == MXL_STATUS_OK);
+        reader = newReader;
+    };
+
+    // Transfers went to bounce buffer entries 0 and 1 before the change; the next one must use entry 2, not overwrite entry 0, which the
+    // target may not have read yet. The target runs in this process, so its entry headers can be read where the remote addresses are virtual
+    // addresses (SHM, not TCP).
+#ifdef MXL_FABRICS_OFI
+    auto checkBounceEntries = [&](mxlFabricsTargetInfo targetInfo)
+    {
+        auto const& entries = mxl::lib::fabrics::ofi::TargetInfo::fromAPI(targetInfo)->remoteRegions;
+        auto const entryHeadIndex = [&](std::size_t entry)
+        {
+            // NOLINTNEXTLINE(performance-no-int-to-ptr): the address is the target's, in this process.
+            return reinterpret_cast<mxl::lib::fabrics::ofi::AudioEntryHeader const*>(entries[entry].addr)->headIndex;
+        };
+        if (entries[0].addr != 0)
+        {
+            REQUIRE(entryHeadIndex(0) == 1000);
+            REQUIRE(entryHeadIndex(2) == 1100);
+        }
+    };
+#endif
+
+    // A flow with a different layout is rejected, and so is any change while a removed target may still have writes in flight.
+    auto checkRejections = [&](mxlFabricsTargetInfo targetInfo)
+    {
+        auto const videoDef = mxl::tests::readFile("../data/v210_flow.json");
+        mxlFlowWriter videoWriter;
+        REQUIRE(mxlCreateFlowWriter(sourceInstance, videoDef.c_str(), nullptr, &videoWriter, nullptr, nullptr) == MXL_STATUS_OK);
+        mxlFlowReader videoReader;
+        REQUIRE(mxlCreateFlowReader(instance, "5fbec3b1-1b0f-417d-9059-8b94a47197ed", "", &videoReader) == MXL_STATUS_OK);
+        REQUIRE(mxlFabricsInitiatorSetReader(initiator, videoReader) == MXL_ERR_INVALID_ARG);
+        REQUIRE(mxlReleaseFlowReader(instance, videoReader) == MXL_STATUS_OK);
+        REQUIRE(mxlReleaseFlowWriter(sourceInstance, videoWriter) == MXL_STATUS_OK);
+
+        std::uint64_t dummyIndex;
+        std::size_t dummyCount;
+        waitForTransferStart([&]() { mxlFabricsTargetReadSamplesNonBlocking(target, &dummyIndex, &dummyCount); },
+            [&]() { requireProgressStatus([&]() { return mxlFabricsInitiatorMakeProgressNonBlocking(initiator); }, "initiator"); },
+            [&]() { return mxlFabricsInitiatorTransferSamples(initiator, 1100, 100); });
+        REQUIRE(mxlFabricsInitiatorRemoveTarget(initiator, targetInfo) == MXL_STATUS_OK);
+        REQUIRE(mxlFabricsInitiatorSetReader(initiator, reader) == MXL_ERR_NOT_READY);
+        // Once progress reports nothing pending, the change succeeds. Progress comes first, so it cannot report that before the write completes.
+        pollUntilSuccess(
+            [&]()
+            {
+                auto const status = mxlFabricsInitiatorMakeProgressNonBlocking(initiator);
+                mxlFabricsTargetReadSamplesNonBlocking(target, &dummyIndex, &dummyCount);
+                return status == MXL_STATUS_OK;
+            },
+            POLL_TIMEOUT,
+            "The removed target's writes did not complete in 5 seconds");
+        REQUIRE(mxlFabricsInitiatorSetReader(initiator, reader) == MXL_STATUS_OK);
+    };
+
+    auto run = [&](mxlFabricsInterfaceConfig const& targetIface, mxlFabricsInterfaceConfig const& initiatorIface)
+    {
+        auto targetConfig = mxlFabricsTargetConfig{.version = MXL_FABRICS_API_VERSION, .interface = targetIface, .writer = targetWriter};
+        mxlFabricsTargetInfo targetInfo;
+        REQUIRE(mxlFabricsTargetSetup(target, &targetConfig, nullptr, &targetInfo) == MXL_STATUS_OK);
+
+        auto initiatorConfig = mxlFabricsInitiatorConfig{.version = MXL_FABRICS_API_VERSION, .interface = initiatorIface, .reader = reader};
+        REQUIRE(mxlFabricsInitiatorSetup(initiator, &initiatorConfig, nullptr) == MXL_STATUS_OK);
+        REQUIRE(mxlFabricsInitiatorAddTarget(initiator, targetInfo) == MXL_STATUS_OK);
+
+        std::uint64_t dummyIndex;
+        std::size_t dummyCount;
+        waitForConnection([&]() { mxlFabricsTargetReadSamplesNonBlocking(target, &dummyIndex, &dummyCount); },
+            [&]() { return mxlFabricsInitiatorMakeProgressNonBlocking(initiator); });
+
+        writeSamples(sourceWriter, 1000, 100, 0x11);
+        transferAndCheck(1000, 100, 0x11);
+
+        // The reader cannot be changed while a transfer is pending.
+        waitForTransferStart([&]() { mxlFabricsTargetReadSamplesNonBlocking(target, &dummyIndex, &dummyCount); },
+            [&]() { requireProgressStatus([&]() { return mxlFabricsInitiatorMakeProgressNonBlocking(initiator); }, "initiator"); },
+            [&]() { return mxlFabricsInitiatorTransferSamples(initiator, 1000, 100); });
+        REQUIRE(mxlFabricsInitiatorSetReader(initiator, reader) == MXL_ERR_NOT_READY);
+        waitForConnection([&]() { mxlFabricsTargetReadSamplesNonBlocking(target, &dummyIndex, &dummyCount); },
+            [&]() { return mxlFabricsInitiatorMakeProgressNonBlocking(initiator); });
+
+        recreateSource();
+        writeSamples(sourceWriter, 1100, 100, 0x22);
+        transferAndCheck(1100, 100, 0x22);
+#ifdef MXL_FABRICS_OFI
+        checkBounceEntries(targetInfo);
+#endif
+        checkRejections(targetInfo);
+
+        mxlFabricsFreeTargetInfo(targetInfo);
+    };
+
+    auto iface = [](mxlFabricsProvider provider, char const* node, char const* service)
+    {
+        return mxlFabricsInterfaceConfig{
+            .version = MXL_FABRICS_API_VERSION,
+            .provider = provider,
+            .caps = {.version = MXL_FABRICS_API_VERSION,
+                     .flags = MXL_FABRICS_IFACE_CAP_BLOCKING_OPERATIONS | MXL_FABRICS_IFACE_CAP_REMOTE_WRITE,
+                     .maxMessageSize = 0},
+            .address = {.node = node, .service = service},
+            .attr = nullptr,
+        };
+    };
+
+    SECTION("RC")
+    {
+        run(iface(MXL_FABRICS_PROVIDER_TCP, "127.0.0.1", nullptr), iface(MXL_FABRICS_PROVIDER_TCP, "127.0.0.1", nullptr));
+    }
+
+    SECTION("RDM")
+    {
+        run(iface(MXL_FABRICS_PROVIDER_SHM, "target", "test"), iface(MXL_FABRICS_PROVIDER_SHM, "initiator", "test"));
+    }
+
+    REQUIRE(mxlReleaseFlowReader(newReaderInstance, reader) == MXL_STATUS_OK);
+    REQUIRE(mxlReleaseFlowReader(instance, targetReader) == MXL_STATUS_OK);
+    REQUIRE(mxlReleaseFlowWriter(instance, targetWriter) == MXL_STATUS_OK);
+    REQUIRE(mxlReleaseFlowWriter(sourceInstance, sourceWriter) == MXL_STATUS_OK);
+    REQUIRE(mxlFabricsDestroyInitiator(fabrics, initiator) == MXL_STATUS_OK);
+    REQUIRE(mxlFabricsDestroyTarget(fabrics, target) == MXL_STATUS_OK);
+    REQUIRE(mxlFabricsDestroyInstance(fabrics) == MXL_STATUS_OK);
+    REQUIRE(mxlDestroyInstance(newReaderInstance) == MXL_STATUS_OK);
+    REQUIRE(mxlDestroyInstance(sourceInstance) == MXL_STATUS_OK);
     REQUIRE(mxlDestroyInstance(instance) == MXL_STATUS_OK);
 }
 
